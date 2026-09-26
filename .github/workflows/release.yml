@@ -1,0 +1,192 @@
+name: Build and release Windows ARM64 FFmpeg
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "vcpkg.json"
+      - ".github/workflows/release.yml"
+
+permissions:
+  contents: write
+
+env:
+  VCPKG_COMMIT: 18ff00a7d2697e23f22e2a2293c3fa6468a50c06
+  FFMPEG_VERSION: 9.0.2
+  RELEASE_REVISION: lvs1
+  RELEASE_TAG: ffmpeg-9.0.2-lvs1
+  ASSET_NAME: ffmpeg-9.0.2-windows-arm64-lgpl-lvs1.zip
+
+jobs:
+  build-release:
+    name: Build and release Windows ARM64 FFmpeg
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout build repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Checkout pinned vcpkg
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ env.VCPKG_COMMIT }}
+          path: vcpkg
+          fetch-depth: 1
+
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        run: |
+          & "${{ github.workspace }}\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # vcpkg's FFmpeg `all` feature is the LGPL-compatible feature set.
+      # The manifest deliberately does not enable FFmpeg `gpl` or `nonfree`,
+      # nor x264/x265/fdk-aac. OpenH264 is included by `all`.
+      - name: Build FFmpeg for Windows ARM64
+        shell: pwsh
+        run: |
+          $installRoot = Join-Path $env:RUNNER_TEMP "vcpkg-installed"
+          $vcpkg = Join-Path $env:GITHUB_WORKSPACE "vcpkg\vcpkg.exe"
+
+          & $vcpkg install `
+            --recurse `
+            --triplet arm64-windows `
+            --x-manifest-root $env:GITHUB_WORKSPACE `
+            --x-install-root $installRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $tripletRoot = Join-Path $installRoot "arm64-windows"
+          $tools = Join-Path $tripletRoot "tools\ffmpeg"
+          $bin = Join-Path $tripletRoot "bin"
+          $stage = Join-Path $env:RUNNER_TEMP "ffmpeg-arm64-stage"
+
+          Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+
+          if (-not (Test-Path $tools)) { throw "Missing vcpkg FFmpeg tools directory: $tools" }
+          if (-not (Test-Path $bin)) { throw "Missing vcpkg ARM64 runtime directory: $bin" }
+
+          Copy-Item (Join-Path $tools "*") $stage -Recurse -Force
+          Copy-Item (Join-Path $bin "*") $stage -Recurse -Force
+
+          $ffmpegExe = Join-Path $stage "ffmpeg.exe"
+          $ffprobeExe = Join-Path $stage "ffprobe.exe"
+          if (-not (Test-Path $ffmpegExe)) { throw "ARM64 build did not produce ffmpeg.exe" }
+          if (-not (Test-Path $ffprobeExe)) { throw "ARM64 build did not produce ffprobe.exe" }
+
+          $openh264 = Get-ChildItem $stage -Filter "*openh264*.dll" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $openh264) { throw "ARM64 bundle does not contain an OpenH264 runtime DLL" }
+          Write-Host "OpenH264 runtime: $($openh264.Name)"
+
+          $licenseDir = Join-Path $stage "licenses"
+          New-Item -ItemType Directory -Path $licenseDir -Force | Out-Null
+          $share = Join-Path $tripletRoot "share"
+          Get-ChildItem $share -Filter copyright -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            $component = Split-Path $_.DirectoryName -Leaf
+            Copy-Item $_.FullName (Join-Path $licenseDir "$component.txt") -Force
+          }
+          Copy-Item (Join-Path $env:GITHUB_WORKSPACE "vcpkg.json") (Join-Path $licenseDir "ffmpeg-vcpkg-manifest.json") -Force
+
+          @(
+            "Lyric Video Studio Windows ARM64 FFmpeg bundle"
+            "FFmpeg: $env:FFMPEG_VERSION"
+            "Architecture: Windows ARM64"
+            "Triplet: arm64-windows"
+            "Build system: vcpkg"
+            "vcpkg baseline: $env:VCPKG_COMMIT"
+            "Feature policy: ffmpeg[all,ffmpeg,ffprobe]"
+            "License policy: LGPL-compatible vcpkg FFmpeg feature set; FFmpeg GPL and nonfree features are not enabled"
+            "OpenH264: enabled"
+            "Release revision: $env:RELEASE_REVISION"
+            "Source commit: $env:GITHUB_SHA"
+          ) | Set-Content (Join-Path $stage "FFMPEG_BUILD_INFO.txt")
+
+          "FFMPEG_STAGE=$stage" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify ARM64 PE binaries
+        shell: pwsh
+        run: |
+          function Get-PeMachine([string] $path) {
+            $bytes = [System.IO.File]::ReadAllBytes($path)
+            if ($bytes.Length -lt 256) { throw "File is too small to be a PE: $path" }
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+            if ($peOffset -lt 0 -or ($peOffset + 6) -gt $bytes.Length) { throw "Invalid PE header: $path" }
+            return [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          }
+
+          $required = @(
+            (Join-Path $env:FFMPEG_STAGE "ffmpeg.exe"),
+            (Join-Path $env:FFMPEG_STAGE "ffprobe.exe")
+          )
+          $required += Get-ChildItem $env:FFMPEG_STAGE -Filter "av*.dll" -File | ForEach-Object { $_.FullName }
+          $required += Get-ChildItem $env:FFMPEG_STAGE -Filter "sw*.dll" -File | ForEach-Object { $_.FullName }
+          $required += Get-ChildItem $env:FFMPEG_STAGE -Filter "*openh264*.dll" -File | ForEach-Object { $_.FullName }
+
+          if (-not (Get-ChildItem $env:FFMPEG_STAGE -Filter "avcodec-*.dll" -File -ErrorAction SilentlyContinue)) {
+            throw "No shared avcodec DLL found in release bundle"
+          }
+
+          foreach ($file in ($required | Select-Object -Unique)) {
+            if (-not (Test-Path $file)) { throw "Missing expected ARM64 binary: $file" }
+            $machine = Get-PeMachine $file
+            Write-Host "$([IO.Path]::GetFileName($file)): PE machine 0x$($machine.ToString('X4'))"
+            if ($machine -ne 0xAA64) {
+              throw "$file is not ARM64 (expected PE machine 0xAA64)."
+            }
+          }
+
+      - name: Create release ZIP
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP $env:ASSET_NAME
+          Remove-Item $zip -Force -ErrorAction SilentlyContinue
+          Compress-Archive -Path (Join-Path $env:FFMPEG_STAGE "*") -DestinationPath $zip -CompressionLevel Optimal
+          if (-not (Test-Path $zip)) { throw "Failed to create release ZIP" }
+          "RELEASE_ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Release asset: $zip"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET_NAME }}
+          path: ${{ env.RELEASE_ZIP }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Create or update GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = @"
+          Windows ARM64 FFmpeg $env:FFMPEG_VERSION build for Lyric Video Studio.
+
+          - Target: Windows ARM64
+          - vcpkg baseline: $env:VCPKG_COMMIT
+          - Features: ffmpeg[all,ffmpeg,ffprobe]
+          - OpenH264 enabled
+          - AV1 support included through the LGPL-compatible vcpkg feature set
+          - FFmpeg GPL/nonfree features are not enabled
+          - Bundle includes runtime dependency DLLs and collected license notices
+          "@
+
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $env:RELEASE_TAG already exists; replacing asset $env:ASSET_NAME"
+            gh release upload $env:RELEASE_TAG $env:RELEASE_ZIP --repo $env:GITHUB_REPOSITORY --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            gh release edit $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --notes $notes
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            gh release create $env:RELEASE_TAG $env:RELEASE_ZIP `
+              --repo $env:GITHUB_REPOSITORY `
+              --target $env:GITHUB_SHA `
+              --title "FFmpeg $env:FFMPEG_VERSION Windows ARM64 ($env:RELEASE_REVISION)" `
+              --notes $notes
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
