@@ -1,0 +1,16 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "lvs-ffmpeg-windows-arm64",
+  "builtin-baseline": "18ff00a7d2697e23f22e2a2293c3fa6468a50c06",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": [
+        "ffmpeg",
+        "ffprobe",
+        "all"
+      ]
+    }
+  ]
+}
